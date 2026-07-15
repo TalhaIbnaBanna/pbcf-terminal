@@ -15,8 +15,9 @@ export const useSheetData = () => {
     const fetchData = async () => {
       try {
         setLoading(true);
-        // Add cache busting for live updates during development
-        const response = await fetch(`${DATA_URL}?t=${new Date().getTime()}`);
+        // Add cache busting for live updates
+        const separator = DATA_URL.includes('?') ? '&' : '?';
+        const response = await fetch(`${DATA_URL}${separator}t=${new Date().getTime()}`);
         if (!response.ok) {
           throw new Error('Network response was not ok');
         }

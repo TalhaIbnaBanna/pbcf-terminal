@@ -20,14 +20,28 @@ export const parseCSVData = (csvText) => {
   });
 };
 
-const parsePct = (val) => {
-  if (typeof val === 'string' && val.includes('%')) {
-    return parseFloat(val.replace('%', ''));
+const parseMoney = (val) => {
+  if (val === null || val === undefined) return NaN;
+  if (typeof val === 'number') return val;
+  if (typeof val === 'string') {
+    // Remove currency symbols, commas, and any non-numeric chars except decimal/minus
+    const clean = val.replace(/[^-0-9.]/g, '');
+    const parsed = parseFloat(clean);
+    return isNaN(parsed) ? NaN : parsed;
   }
-  return parseFloat(val) || 0;
+  return NaN;
 };
 
-// Standard Deviation utility
+const parsePct = (val) => {
+  if (val === null || val === undefined) return 0;
+  if (typeof val === 'number') return val;
+  if (typeof val === 'string') {
+    const clean = val.replace(/[%\s]/g, '');
+    return parseFloat(clean) || 0;
+  }
+  return 0;
+};
+
 const stdDev = (arr) => {
   if (arr.length <= 1) return 0;
   const mean = arr.reduce((a, b) => a + b) / arr.length;
@@ -37,96 +51,147 @@ const stdDev = (arr) => {
 const formatData = (data) => {
   if (!data || data.length < 3) throw new Error("Invalid CSV structure. Expected Targets, Sectors, and Data rows.");
 
-  const targetRow = data[0];
-  const sectorRow = data[1];
-  const dataRows = data.slice(2);
+  // Clean all keys and values to be extremely robust against whitespace/formatting
+  const cleanData = data.map(row => {
+    const newRow = {};
+    Object.keys(row).forEach(key => {
+      if (key) {
+        const cleanKey = key.trim();
+        newRow[cleanKey] = row[key];
+      }
+    });
+    return newRow;
+  });
 
-  // Identify tickers and metrics
+  const targetRow = cleanData[0];
+  const sectorRow = cleanData[1];
+  const dataRows = cleanData.slice(2);
+
   const headers = Object.keys(targetRow);
-  const tickers = headers.filter(k => k !== 'Date' && k !== 'Benchmark' && !k.startsWith('Metric_'));
   
-  // Extract Static Metrics
+  // Brute-force ticker detection:
+  const tickers = headers.filter(k => {
+    if (!k) return false;
+    const cleanK = k.trim().toUpperCase();
+    
+    // Explicitly allow your bonds
+    if (cleanK === 'IEF' || cleanK === 'LQD') return true;
+    
+    // Ignore internal columns
+    if (cleanK === 'DATE' || cleanK.includes('_BENCH') || cleanK.startsWith('METRIC_')) return false;
+    
+    // For everything else, if it has a target weight OR it looks like a ticker, include it
+    const weight = parsePct(targetRow[k]);
+    return weight > 0 || (cleanK.length <= 5 && cleanK.length >= 2);
+  });
+  
   const fundMetrics = {
     aum: targetRow['Metric_AUM'] || '$100K',
-    expectedReturn: targetRow['Metric_ExpectedReturn'] || '9.16%',
+    expectedReturn: targetRow['Metric_ExpectedReturn'] || '8.68%',
     targetVol: targetRow['Metric_TargetVol'] || '12-13%',
     targetSharpe: targetRow['Metric_TargetSharpe'] || '0.70',
     expenseRatio: targetRow['Metric_ExpenseRatio'] || '1.55%'
   };
 
-  // Extract holdings structure
   const holdingsConfig = tickers.map(t => ({
     ticker: t,
     targetWeight: parsePct(targetRow[t]),
-    sector: sectorRow[t]
+    sector: sectorRow[t] || 'Other'
   }));
 
-  // Process Daily Data
   const performanceHistory = [];
   const dailyReturns = [];
-  let firstDayValue = null;
-  let firstDayBenchmark = null;
-  let prevValue = null;
+  let prevPortfolioValue = null;
+  let prevBenchValues = { AGG: null, SPY: null, QQQ: null };
+  let prevTickerValues = {}; 
+  let compoundedBenchNav = 100000; 
+  let compoundedPortfolioNav = 100000;
+
+  const startDate = new Date(dataRows[0].Date);
 
   dataRows.forEach((row, i) => {
     let portfolioValue = 0;
+    
     tickers.forEach(t => {
-      portfolioValue += parseFloat(row[t]) || 0;
+      const rawVal = row[t];
+      const val = parseMoney(rawVal);
+      
+      // Fallback logic: Use current if it's a number, otherwise use previous
+      const tickerVal = (!isNaN(val)) ? val : (prevTickerValues[t] || 0);
+      
+      portfolioValue += tickerVal;
+      prevTickerValues[t] = tickerVal; 
     });
 
-    const benchmarkValue = parseFloat(row.Benchmark) || 0;
+    // Composite Benchmark Math
+    let aggVal = parseMoney(row.AGG_Bench);
+    let spyVal = parseMoney(row.SPY_Bench);
+    let qqqVal = parseMoney(row.QQQ_Bench);
 
-    if (i === 0) {
-      firstDayValue = portfolioValue;
-      firstDayBenchmark = benchmarkValue;
-    } else {
-      dailyReturns.push((portfolioValue / prevValue) - 1);
+    if (isNaN(aggVal)) aggVal = prevBenchValues.AGG || 0;
+    if (isNaN(spyVal)) spyVal = prevBenchValues.SPY || 0;
+    if (isNaN(qqqVal)) qqqVal = prevBenchValues.QQQ || 0;
+
+    if (i > 0) {
+      const aggRet = prevBenchValues.AGG ? (aggVal / prevBenchValues.AGG) - 1 : 0;
+      const spyRet = prevBenchValues.SPY ? (spyVal / prevBenchValues.SPY) - 1 : 0;
+      const qqqRet = prevBenchValues.QQQ ? (qqqVal / prevBenchValues.QQQ) - 1 : 0;
+
+      const compositeDailyReturn = (0.40 * aggRet) + (0.40 * spyRet) + (0.20 * qqqRet);
+      compoundedBenchNav *= (1 + compositeDailyReturn);
+
+      const portfolioDailyRet = prevPortfolioValue ? (portfolioValue / prevPortfolioValue) - 1 : 0;
+      compoundedPortfolioNav *= (1 + portfolioDailyRet);
+      
+      if (portfolioDailyRet !== 0) {
+        dailyReturns.push(portfolioDailyRet);
+      }
     }
 
-    prevValue = portfolioValue;
+    prevPortfolioValue = portfolioValue;
+    prevBenchValues = { AGG: aggVal, SPY: spyVal, QQQ: qqqVal };
 
     performanceHistory.push({
       date: row.Date,
-      portfolioValue: portfolioValue,
-      nav: (portfolioValue / firstDayValue) * 10000, // Rebase to $10,000 for chart
-      benchmarkValue: benchmarkValue,
-      benchmarkNav: (benchmarkValue / firstDayBenchmark) * 10000, // Rebase benchmark
-      rawRow: row // Keep raw data for latest KPIs
+      portfolioValue,
+      nav: compoundedPortfolioNav,
+      benchmarkNav: compoundedBenchNav,
+      sanitizedTickerValues: { ...prevTickerValues },
+      rawRow: row
     });
   });
 
   const latestRow = performanceHistory[performanceHistory.length - 1];
-  const latestRaw = latestRow.rawRow;
-  
-  // Calculate Returns
-  const ytdReturn = ((latestRow.portfolioValue / firstDayValue) - 1) * 100;
-  
-  // Annualized Volatility (assuming daily data, 252 trading days)
-  const dailyVolatility = stdDev(dailyReturns);
-  const annualizedVolatility = dailyVolatility * Math.sqrt(252) * 100; 
+  const firstValidRow = performanceHistory.find(d => d.portfolioValue > 0) || performanceHistory[0];
 
-  // Sharpe Ratio (assuming 0% risk free rate for simplicity)
-  const sharpeRatio = dailyVolatility === 0 ? 0 : (ytdReturn / annualizedVolatility);
+  const hpr = firstValidRow.portfolioValue > 0 ? (latestRow.portfolioValue / firstValidRow.portfolioValue) - 1 : 0;
+  const benchHpr = firstValidRow.benchmarkNav > 0 ? (latestRow.benchmarkNav / firstValidRow.benchmarkNav) - 1 : 0;
+  
+  const daysElapsed = Math.max(1, (new Date(latestRow.date) - startDate) / (1000 * 60 * 60 * 24));
+  const annualizedReturn = (Math.pow(1 + hpr, 365 / daysElapsed) - 1) * 100;
+
+  const dailyVolatility = stdDev(dailyReturns);
+  const annualizedVolatility = dailyVolatility * Math.sqrt(252) * 100;
+  const sharpeRatio = dailyVolatility === 0 ? 0 : (annualizedReturn / annualizedVolatility);
 
   const latestKPIs = {
-    nav: latestRow.portfolioValue, // Or whatever real NAV representation you want
-    ytdReturn: ytdReturn,
+    nav: latestRow.portfolioValue,
+    ytdReturn: hpr * 100,
+    annualizedReturn: annualizedReturn,
     volatility: annualizedVolatility.toFixed(2) + '%',
-    sharpeRatio: sharpeRatio.toFixed(2)
+    sharpeRatio: sharpeRatio.toFixed(2),
+    alpha: (hpr - benchHpr) * 100
   };
 
-  // Calculate live weights
-  const totalValue = latestRow.portfolioValue;
   const holdings = holdingsConfig.map(h => {
-    const liveVal = parseFloat(latestRaw[h.ticker]) || 0;
+    const liveVal = latestRow.sanitizedTickerValues[h.ticker] || 0;
     return {
       ...h,
       liveValue: liveVal,
-      liveWeight: (liveVal / totalValue) * 100
+      liveWeight: (liveVal / latestRow.portfolioValue) * 100
     };
   });
 
-  // Calculate sleeve drifts
   const uniqueSectors = [...new Set(holdings.map(h => h.sector))];
   const allocations = uniqueSectors.map(sector => {
     const sectorHoldings = holdings.filter(h => h.sector === sector);
